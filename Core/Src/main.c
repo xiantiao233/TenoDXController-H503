@@ -30,6 +30,7 @@
 #include "keyboard_app.h"
 #include "magic_config.h"
 #include "mai2led_app.h"
+#include "touch.h"
 #include "ws28xx.h"
 /* USER CODE END Includes */
 
@@ -105,7 +106,6 @@ bool WS28XX_SetPixels_RGB(WS28XX_HandleTypeDef *hLed,
 
 	return answer;
 }
-
 /* USER CODE END 0 */
 
 /**
@@ -152,6 +152,7 @@ int main(void)
     }
 
 	tusb_init();
+    touch_init();
     magic_config_init();
     keyboard_app_init(mai2led_app_restore_idle_lights);
 	mai2led_app_init(&(mai2led_app_config_t)
@@ -168,6 +169,7 @@ int main(void)
 	while (1)
 	{
 		tud_task();
+        touch_task();
 		keyboard_app_poll();
 		mai2led_app_task();
         magic_config_task();
