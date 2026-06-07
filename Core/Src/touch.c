@@ -12,7 +12,10 @@
 #define TOUCH_REGISTER             0x00U
 #define TOUCH_DATA_LENGTH          35U
 #define TOUCH_PERIOD_MS            20U
+#define TOUCH_RETRY_PERIOD_MS      500U
+#define TOUCH_TRANSFER_TIMEOUT_MS  50U
 #define TOUCH_FRAME_LENGTH         47U
+#define TOUCH_ERROR_TIMEOUT        0x80000000U
 
 typedef enum
 {
@@ -32,27 +35,39 @@ static const uint8_t touch_addresses[TOUCH_DEVICE_COUNT] = {0x08U};
 static uint8_t touch_data[TOUCH_DEVICE_COUNT][TOUCH_DATA_LENGTH];
 static uint8_t touch_status[TOUCH_DEVICE_COUNT];
 static uint32_t touch_error[TOUCH_DEVICE_COUNT];
-static uint16_t touch_sequence;
-static uint8_t touch_device_index;
-static uint32_t touch_next_tick;
+static uint16_t touch_sequence[TOUCH_DEVICE_COUNT];
+static uint32_t touch_next_tick[TOUCH_DEVICE_COUNT];
+static bool touch_frame_pending[TOUCH_DEVICE_COUNT];
+static uint8_t touch_active_device;
+static uint8_t touch_schedule_cursor;
+static uint32_t touch_transfer_start_tick;
 static bool touch_transfer_active;
-static bool touch_batch_ready;
 static volatile touch_event_t touch_event;
 static volatile uint32_t touch_callback_error;
 
-static void touch_start_read(void);
+static bool touch_start_due_read(void);
+static void touch_start_read(uint8_t device_index);
 static void touch_finish_read(touch_status_t status, uint32_t error);
-static void touch_send_batch(void);
+static void touch_recover_i2c(void);
+static void touch_send_pending_frames(void);
 static void touch_build_frame(uint8_t device_index, uint8_t *frame);
 
 void touch_init(void)
 {
-    touch_device_index = 0U;
-    touch_sequence = 0U;
+    uint32_t now = HAL_GetTick();
+
+    memset(touch_sequence, 0, sizeof(touch_sequence));
+    memset(touch_frame_pending, 0, sizeof(touch_frame_pending));
+
+    for (uint8_t index = 0U; index < TOUCH_DEVICE_COUNT; index++)
+    {
+        touch_next_tick[index] = now;
+    }
+
+    touch_active_device = 0U;
+    touch_schedule_cursor = 0U;
     touch_transfer_active = false;
-    touch_batch_ready = false;
     touch_event = TOUCH_EVENT_NONE;
-    touch_next_tick = HAL_GetTick();
 }
 
 void touch_task(void)
@@ -75,32 +90,66 @@ void touch_task(void)
             touch_finish_read(TOUCH_STATUS_TRANSFER_ERROR,
                     touch_callback_error);
         }
+        else if ((uint32_t)(HAL_GetTick() - touch_transfer_start_tick)
+                >= TOUCH_TRANSFER_TIMEOUT_MS)
+        {
+            touch_recover_i2c();
+            touch_finish_read(TOUCH_STATUS_TRANSFER_ERROR,
+                    TOUCH_ERROR_TIMEOUT);
+        }
     }
 
-    if (touch_batch_ready)
+    touch_send_pending_frames();
+
+    if (!touch_transfer_active)
     {
-        touch_send_batch();
-    }
-    else if (!touch_transfer_active
-            && ((int32_t)(HAL_GetTick() - touch_next_tick) >= 0))
-    {
-        touch_start_read();
+        touch_start_due_read();
     }
 }
 
-static void touch_start_read(void)
+static bool touch_start_due_read(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    for (uint8_t offset = 0U; offset < TOUCH_DEVICE_COUNT; offset++)
+    {
+        uint8_t device_index =
+                (uint8_t)((touch_schedule_cursor + offset)
+                        % TOUCH_DEVICE_COUNT);
+
+        if ((int32_t)(now - touch_next_tick[device_index]) >= 0)
+        {
+            touch_schedule_cursor =
+                    (uint8_t)((device_index + 1U) % TOUCH_DEVICE_COUNT);
+            touch_start_read(device_index);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void touch_start_read(uint8_t device_index)
 {
     HAL_StatusTypeDef result;
 
-    memset(touch_data[touch_device_index], 0, TOUCH_DATA_LENGTH);
+    if ((HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY)
+            || (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY) != RESET))
+    {
+        touch_recover_i2c();
+    }
+
+    touch_active_device = device_index;
+    memset(touch_data[device_index], 0, TOUCH_DATA_LENGTH);
     touch_event = TOUCH_EVENT_NONE;
+    touch_transfer_start_tick = HAL_GetTick();
     touch_transfer_active = true;
 
     result = HAL_I2C_Mem_Read_IT(&hi2c1,
-            (uint16_t)(touch_addresses[touch_device_index] << 1U),
+            (uint16_t)(touch_addresses[device_index] << 1U),
             TOUCH_REGISTER,
             I2C_MEMADD_SIZE_8BIT,
-            touch_data[touch_device_index],
+            touch_data[device_index],
             TOUCH_DATA_LENGTH);
 
     if (result != HAL_OK)
@@ -109,19 +158,32 @@ static void touch_start_read(void)
     }
 }
 
+static void touch_recover_i2c(void)
+{
+    HAL_I2C_DeInit(&hi2c1);
+    __HAL_RCC_I2C1_FORCE_RESET();
+    __NOP();
+    __HAL_RCC_I2C1_RELEASE_RESET();
+    MX_I2C1_Init();
+    touch_event = TOUCH_EVENT_NONE;
+}
+
 static void touch_finish_read(touch_status_t status, uint32_t error)
 {
-    touch_status[touch_device_index] = (uint8_t)status;
-    touch_error[touch_device_index] = error;
-    touch_transfer_active = false;
-    touch_device_index++;
+    uint32_t retry_period = TOUCH_RETRY_PERIOD_MS;
 
-    if (touch_device_index >= TOUCH_DEVICE_COUNT)
+    touch_status[touch_active_device] = (uint8_t)status;
+    touch_error[touch_active_device] = error;
+    touch_sequence[touch_active_device]++;
+    touch_frame_pending[touch_active_device] = true;
+
+    if (status == TOUCH_STATUS_OK)
     {
-        touch_device_index = 0U;
-        touch_batch_ready = true;
-        touch_sequence++;
+        retry_period = TOUCH_PERIOD_MS;
     }
+
+    touch_next_tick[touch_active_device] = HAL_GetTick() + retry_period;
+    touch_transfer_active = false;
 }
 
 static void touch_build_frame(uint8_t device_index, uint8_t *frame)
@@ -136,8 +198,8 @@ static void touch_build_frame(uint8_t device_index, uint8_t *frame)
     frame[5] = (uint8_t)(touch_error[device_index] >> 8U);
     frame[6] = (uint8_t)(touch_error[device_index] >> 16U);
     frame[7] = (uint8_t)(touch_error[device_index] >> 24U);
-    frame[8] = (uint8_t)(touch_sequence >> 0U);
-    frame[9] = (uint8_t)(touch_sequence >> 8U);
+    frame[8] = (uint8_t)(touch_sequence[device_index] >> 0U);
+    frame[9] = (uint8_t)(touch_sequence[device_index] >> 8U);
     frame[10] = TOUCH_DATA_LENGTH;
     memcpy(&frame[11], touch_data[device_index], TOUCH_DATA_LENGTH);
 
@@ -149,28 +211,35 @@ static void touch_build_frame(uint8_t device_index, uint8_t *frame)
     frame[TOUCH_FRAME_LENGTH - 1U] = checksum;
 }
 
-static void touch_send_batch(void)
+static void touch_send_pending_frames(void)
 {
-    uint8_t frames[TOUCH_DEVICE_COUNT][TOUCH_FRAME_LENGTH];
-    const uint32_t batch_length = TOUCH_DEVICE_COUNT * TOUCH_FRAME_LENGTH;
+    uint8_t frame[TOUCH_FRAME_LENGTH];
 
     if (!tud_cdc_n_connected(TOUCH_CDC_ITF)
-            || (tud_cdc_n_write_available(TOUCH_CDC_ITF) < batch_length))
+            || (tud_cdc_n_write_available(TOUCH_CDC_ITF)
+                    < TOUCH_FRAME_LENGTH))
     {
         return;
     }
 
     for (uint8_t index = 0U; index < TOUCH_DEVICE_COUNT; index++)
     {
-        touch_build_frame(index, frames[index]);
-    }
+        if (!touch_frame_pending[index]
+                || (touch_transfer_active && (index == touch_active_device)))
+        {
+            continue;
+        }
 
-    if (tud_cdc_n_write(TOUCH_CDC_ITF, frames, batch_length)
-            == batch_length)
-    {
-        tud_cdc_n_write_flush(TOUCH_CDC_ITF);
-        touch_batch_ready = false;
-        touch_next_tick = HAL_GetTick() + TOUCH_PERIOD_MS;
+        touch_build_frame(index, frame);
+
+        if (tud_cdc_n_write(TOUCH_CDC_ITF, frame, TOUCH_FRAME_LENGTH)
+                == TOUCH_FRAME_LENGTH)
+        {
+            touch_frame_pending[index] = false;
+            tud_cdc_n_write_flush(TOUCH_CDC_ITF);
+        }
+
+        break;
     }
 }
 
